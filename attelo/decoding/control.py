@@ -10,6 +10,7 @@ import numpy as np
 
 from attelo.learning import (can_predict_proba)
 from attelo.table import (for_attachment, for_labelling, for_intra,
+                          edu_positions,
                           UNRELATED, UNKNOWN)
 from attelo.util import truncate
 from .intra import (IntraInterPair, select_subgrouping)
@@ -153,13 +154,29 @@ def _add_labels(dpack, models, predictions, clobber=True):
 # ---------------------------------------------------------------------
 
 
-def build_candidates(dpack, models, mode):
+def build_candidates(dpack, models, mode, max_dist_by_lbl):
     """
     Extract candidate links (scores and proposed labels
     for each edu pair) from the models for all instances
     in the datapack
 
-    :type models: Team(model)
+    Parameters
+    ----------
+    dpack: Datapack
+        datapack
+    models: Team(model)
+        pair of models for attachment and labelling
+    mode: DecodingMode
+        joint or post-label
+    max_dist_by_lbl: dict(int, (int, int))
+        if a dict is provided, it is used to prune candidates ;
+        the dict contains the maximal length of edges seen in the gold,
+        for each label, separate for left and right attachments
+
+    Returns
+    -------
+    cands: list of (edu_id, edu_id, score, label)
+        candidate scored labelled edges
     """
     if mode != DecodingMode.post_label:
         if not can_predict_proba(models.attach):
@@ -171,13 +188,44 @@ def build_candidates(dpack, models, mode):
             raise DecoderException('Relation labelling model does not '
                                    'know how to predict probabilities')
 
-        return _combine_probs(dpack, models)
+        cands = _combine_probs(dpack, models)
     else:
         attach_pack = for_attachment(dpack)
         pairings = attach_pack.pairings
         confidence = _predict_attach(attach_pack, models)
-        return [(id1, id2, conf, UNKNOWN) for
-                (id1, id2), conf in zip(pairings, confidence)]
+        cands = [(edu1, edu2, conf, UNKNOWN)
+                 for (edu1, edu2), conf
+                 in zip(pairings, confidence)]
+
+    # prune candidates
+    if max_dist_by_lbl is not None:
+        # get the index of each EDU in the document (dict)
+        edu_idx = edu_positions(dpack)
+        # EXPERIMENTAL
+        # /!\ the following code is absolutely BAD and should be rewritten
+        # ASAP
+        dist_max_left = max(v[0] for v in max_dist_by_lbl.values())
+        dist_max_right = max(v[1] for v in max_dist_by_lbl.values())
+        surviving_cands = []
+        for cand in cands:
+            edu1, edu2, score, lbl = cand
+            idx_e1 = edu_idx[edu1.id]
+            idx_e2 = edu_idx[edu2.id]
+            if idx_e1 < idx_e2:  # right attachment
+                dist_edus = idx_e2 - idx_e1
+                if dist_edus <= dist_max_right:
+                    surviving_cands.append(cand)
+            else:  # left attachment
+                dist_edus = idx_e1 - idx_e2
+                if dist_edus <= dist_max_left:
+                    surviving_cands.append(cand)
+        # verbose
+        if True:
+            diff_set = set(cands) - set(surviving_cands)
+            print('pruned {} / {} edges'.format(len(diff_set), len(cands)))
+        cands = surviving_cands
+
+    return cands
 
 
 def _maybe_post_label(dpack, models, predictions,
@@ -192,7 +240,7 @@ def _maybe_post_label(dpack, models, predictions,
         return predictions
 
 
-def decode(dpack, models, decoder, mode):
+def decode(dpack, models, decoder, mode, max_dist_by_lbl=None):
     """
     Decode every instance in the attachment table (predicting
     relations too if we have the data/model for it).
@@ -202,18 +250,29 @@ def decode(dpack, models, decoder, mode):
     you must also supply intra/inter sentential models
     for this
 
-    Return the predictions made.
+    Parameters
+    ----------
+    models: Team(model) | IntraInterPair(Team(model))
+        models used to score candidates
 
-    :type: models: Team(model) or IntraInterPair(Team(model))
+    max_dist_by_lbl: dict(int, (int, int)), optional
+        maximal length of relations for each label, with distinct values
+        for left and right attachments ; if one such dict is provided, it
+        is used to prune the set of candidates considered for decoding
+
+    Returns
+    -------
+    predictions: list of (edu_id, edu_id, label)
+        list of predicted edges
     """
     if callable(getattr(decoder, "decode_sentence", None)):
         func = decode_intra_inter
     else:
         func = decode_vanilla
-    return func(dpack, models, decoder, mode)
+    return func(dpack, models, decoder, mode, max_dist_by_lbl)
 
 
-def decode_vanilla(dpack, models, decoder, mode):
+def decode_vanilla(dpack, models, decoder, mode, max_dist_by_lbl):
     """
     Decode every instance in the attachment table (predicting
     relations too if we have the data/model for it).
@@ -221,12 +280,12 @@ def decode_vanilla(dpack, models, decoder, mode):
 
     :type models: Team(model)
     """
-    prob_distrib = build_candidates(dpack, models, mode)
-    predictions = decoder.decode(prob_distrib)
+    cands = build_candidates(dpack, models, mode, max_dist_by_lbl)
+    predictions = decoder.decode(cands)
     return _maybe_post_label(dpack, models, predictions, mode)
 
 
-def decode_intra_inter(dpack, models, decoder, mode):
+def decode_intra_inter(dpack, models, decoder, mode, max_dist_by_lbl):
     """
     Variant of `decode` which uses an IntraInterDecoder rather than
     a normal decoder

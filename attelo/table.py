@@ -372,7 +372,7 @@ class Multipack(dict):
     pass
 
 
-def _edu_positions(dpack):
+def edu_positions(dpack):
     """Return a dictionary associating each EDU with a position
     identifier. The fake root always has position 0.
 
@@ -397,7 +397,7 @@ def select_window(dpack, window):
     '''
     if window is None:
         return dpack
-    position = _edu_positions(dpack)
+    position = edu_positions(dpack)
     indices = []
     for i, (edu1, edu2) in enumerate(dpack.pairings):
         gap = abs(position[edu2.id] - position[edu1.id])
@@ -417,7 +417,7 @@ def pairing_distances(dpack):
 
     :rtype dict(int, (int, int))
     """
-    position = _edu_positions(dpack)
+    position = edu_positions(dpack)
     max_l = defaultdict(int)
     max_r = defaultdict(int)
     for i, (edu1, edu2) in enumerate(dpack.pairings):

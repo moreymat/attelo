@@ -20,7 +20,7 @@ from attelo.io import (load_multipack,
 from attelo.report import (CombinedReport,
                            EdgeReport)
 from attelo.score import (score_edges)
-from attelo.table import (DataPack)
+from attelo.table import (DataPack, mpack_pairing_distances)
 from attelo.util import (mk_rng, Team)
 from sklearn.linear_model import (LogisticRegression)
 
@@ -53,9 +53,13 @@ scores = []
 for fold in range(num_folds):
     print(">>> doing fold ", fold + 1, file=sys.stderr)
     print("training ... ", file=sys.stderr)
+
     # learn a model for the training data for this fold
     train_pack = select_training(mpack, fold_dict, fold)
     models = learn(train_pack, learners)
+    # get max length of relations, for each label,
+    # distinguishing left and right attachments
+    max_dist_by_lbl = mpack_pairing_distances(train_pack)
 
     fold_predictions = []
     # decode each document separately
@@ -63,7 +67,8 @@ for fold in range(num_folds):
     for onedoc, dpack in test_pack.items():
         print("decoding on file : ", onedoc, file=sys.stderr)
         predictions = decode(dpack, models, decoder,
-                             DecodingMode.joint)
+                             DecodingMode.joint,
+                             max_dist_by_lbl)
         # record the best prediction score (among the decoder nbest)
         doc_scores = [score_edges(dpack, x) for x in predictions]
         scores.append(max(doc_scores,

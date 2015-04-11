@@ -8,6 +8,7 @@ import os
 
 from joblib import (delayed)
 
+from attelo.table import mpack_pairing_distances
 from ..io import (write_predictions_output)
 from ..decoding import (DecoderException, decode)
 
@@ -38,6 +39,7 @@ def concatenate_outputs(mpack, output_path):
 
 
 def _decode_group(dpack, models, decoder, mode,
+                  max_dist_by_lbl,
                   output_path):
     '''
     decode a single group and write its output
@@ -46,7 +48,7 @@ def _decode_group(dpack, models, decoder, mode,
 
     :rtype Count or None
     '''
-    predictions = decode(dpack, models, decoder, mode)
+    predictions = decode(dpack, models, decoder, mode, max_dist_by_lbl)
     if not predictions:
         raise DecoderException('decoder must make at least one prediction')
 
@@ -55,7 +57,7 @@ def _decode_group(dpack, models, decoder, mode,
     write_predictions_output(dpack, first_prediction, output_path)
 
 
-def jobs(mpack, models, decoder, mode, output_path):
+def jobs(mpack, models, decoder, mode, max_dist_by_lbl, output_path):
     """
     Return a list of delayed decoding jobs for the various
     documents in this group
@@ -69,5 +71,6 @@ def jobs(mpack, models, decoder, mode, output_path):
     for onedoc, dpack in mpack.items():
         tmp_output_path = _tmp_output_filename(output_path, onedoc)
         res.append(delayed(_decode_group)(dpack, models, decoder, mode,
+                                          max_dist_by_lbl,
                                           tmp_output_path))
     return res
