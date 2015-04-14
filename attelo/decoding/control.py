@@ -4,6 +4,7 @@ Central interface to the decoders
 
 from __future__ import print_function
 from enum import Enum
+import itertools
 import sys
 
 import numpy as np
@@ -55,10 +56,16 @@ def _predict_attach(dpack, models):
         return models.attach.decision_function(dpack.data)
 
 
-def _predict_relate(dpack, models):
+def _predict_relate(dpack, models, max_dist_by_lbl):
     """
     Return an array of probabilities (that of the best label),
     and an list of labels
+
+    Parameters
+    ----------
+    max_dist_by_lbl: dict(int, (int, int))
+        maximal length of relations by label, for left and right
+        attachments
     """
     if models.relate == 'oracle':
         unrelated = dpack.label_number(UNRELATED)
@@ -68,27 +75,73 @@ def _predict_relate(dpack, models):
         default_to_unk = lambda lbl: unk_lbl if lbl == unrelated else lbl
         # pylint: disable=no-member
         probs = np.ones(dpack.target.shape)
+        # TODO decide on whether oracle should be pruned (max_dist_by_lbl)
         lbls = np.vectorize(default_to_unk)(dpack.target)
         # pylint: enable=no-member
     elif not can_predict_proba(models.relate):
         raise DecoderException('Tried to use a non-prob decoder for relations')
     else:
         all_probs = models.relate.predict_proba(dpack.data)
+        # EXPERIMENTAL: prune with max_dist_by_lbl
+        if max_dist_by_lbl is not None:
+            if False:  # DEBUG
+                print(all_probs[:10])
+            # get the index of each EDU in the document (dict)
+            edu_idx = edu_positions(dpack)
+            pairings = dpack.pairings
+            # for each pairing, compute the signed distance between
+            # the gov and dep EDUs
+            sg_dist = np.array([edu_idx[edu2.id] - edu_idx[edu1.id]
+                                for edu1, edu2 in pairings])
+            # get max for each label, for left and right attachment
+            lmax = np.array([max_dist_by_lbl[lbl][0]
+                             for lbl in models.relate.classes_])
+            rmax = np.array([max_dist_by_lbl[lbl][1]
+                             for lbl in models.relate.classes_])
+            if False:  # DEBUG
+                lbl_strs = [dpack.get_label(lbl)
+                            for lbl in models.relate.classes_]
+                print(lbl_strs)
+                print(lmax)
+                print(rmax)
+            # for each candidate attachment, set the proba of a label to
+            # 0 if the EDUs are farther than the max seen in training
+            # for this label
+            prune_row = lambda sd, row: [(prob if ((sd > 0 and sd <= rmax[i]) or
+                                                   (sd < 0 and -sd <= lmax[i]))
+                                          else 0.0)
+                                         for i, prob in enumerate(row)]
+            pr_probs = np.array([prune_row(sd, row)
+                                 for sd, row
+                                 in itertools.izip(sg_dist, all_probs)])
+            if False:  # DEBUG
+                print(pr_probs[:10])
+                sys.exit()
+            # replace original probs with pruned probs
+            all_probs = pr_probs
+        # end EXPERIMENTAL
         # get the probability associated with the best label
         # pylint: disable=no-member
         probs = np.amax(all_probs, axis=1)
+        lbl_idxs = np.argmax(all_probs, axis=1)
+        lbls = np.array([models.relate.classes_[lbl_idx]
+                         for lbl_idx in lbl_idxs])
         # pylint: enable=no-member
-        lbls = models.relate.predict(dpack.data)
     # pylint: disable=no-member
     get_label = np.vectorize(dpack.get_label)
     # pylint: enable=no-member
     return probs, get_label(lbls)
 
 
-def _combine_probs(dpack, models, debug=False):
+def _combine_probs(dpack, models, max_dist_by_lbl, debug=False):
     """for all EDU pairs, retrieve probability of the best relation
     on that pair, given the probability of an attachment
 
+    Parameters
+    ----------
+    max_dist_by_lbl: dict(int, (int, int))
+        maximal length of relations by label, for left and right
+        attachments
     """
     def link(pair, a_prob, r_prob, label):
         'return a combined-probability link'
@@ -108,7 +161,8 @@ def _combine_probs(dpack, models, debug=False):
     attach_pack = for_attachment(dpack)
     relate_pack = for_labelling(dpack)
     attach_probs = _predict_attach(attach_pack, models)
-    relate_probs, relate_labels = _predict_relate(relate_pack, models)
+    relate_probs, relate_labels = _predict_relate(relate_pack, models,
+                                                  max_dist_by_lbl)
 
     # pylint: disable=star-args
     return [link(*x) for x in
@@ -116,7 +170,7 @@ def _combine_probs(dpack, models, debug=False):
     # pylint: disable=star-args
 
 
-def _add_labels(dpack, models, predictions, clobber=True):
+def _add_labels(dpack, models, predictions, max_dist_by_lbl, clobber=True):
     """given a list of predictions, predict labels for a given set of edges
     (=post-labelling an unlabelled decoding)
 
@@ -130,7 +184,7 @@ def _add_labels(dpack, models, predictions, clobber=True):
     """
 
     relate_pack = for_labelling(dpack)
-    _, relate_labels = _predict_relate(relate_pack, models)
+    _, relate_labels = _predict_relate(relate_pack, models, max_dist_by_lbl)
     label_dict = {(edu1.id, edu2.id): label
                   for (edu1, edu2), label in
                   zip(dpack.pairings, relate_labels)}
@@ -188,7 +242,7 @@ def build_candidates(dpack, models, mode, max_dist_by_lbl):
             raise DecoderException('Relation labelling model does not '
                                    'know how to predict probabilities')
 
-        cands = _combine_probs(dpack, models)
+        cands = _combine_probs(dpack, models, max_dist_by_lbl)
     else:
         attach_pack = for_attachment(dpack)
         pairings = attach_pack.pairings
@@ -197,45 +251,46 @@ def build_candidates(dpack, models, mode, max_dist_by_lbl):
                  for (edu1, edu2), conf
                  in zip(pairings, confidence)]
 
-    # prune candidates
-    if max_dist_by_lbl is not None:
-        # get the index of each EDU in the document (dict)
-        edu_idx = edu_positions(dpack)
-        # EXPERIMENTAL
-        # /!\ the following code is absolutely BAD and should be rewritten
-        # ASAP
-        dist_max_left = max(v[0] for v in max_dist_by_lbl.values())
-        dist_max_right = max(v[1] for v in max_dist_by_lbl.values())
-        surviving_cands = []
-        for cand in cands:
-            edu1, edu2, score, lbl = cand
-            idx_e1 = edu_idx[edu1.id]
-            idx_e2 = edu_idx[edu2.id]
-            if idx_e1 < idx_e2:  # right attachment
-                dist_edus = idx_e2 - idx_e1
-                if dist_edus <= dist_max_right:
-                    surviving_cands.append(cand)
-            else:  # left attachment
-                dist_edus = idx_e1 - idx_e2
-                if dist_edus <= dist_max_left:
-                    surviving_cands.append(cand)
-        # verbose
-        if True:
-            diff_set = set(cands) - set(surviving_cands)
-            print('pruned {} / {} edges'.format(len(diff_set), len(cands)))
-        cands = surviving_cands
+        # prune candidates, for unlabelled left/right attachments
+        if max_dist_by_lbl is not None:
+            # get the index of each EDU in the document (dict)
+            edu_idx = edu_positions(dpack)
+            # EXPERIMENTAL
+            # /!\ the following code is absolutely BAD and should be rewritten
+            # ASAP
+            dist_max_left = max(v[0] for v in max_dist_by_lbl.values())
+            dist_max_right = max(v[1] for v in max_dist_by_lbl.values())
+            surviving_cands = []
+            for cand in cands:
+                edu1, edu2, score, lbl = cand
+                idx_e1 = edu_idx[edu1.id]
+                idx_e2 = edu_idx[edu2.id]
+                if idx_e1 < idx_e2:  # right attachment
+                    dist_edus = idx_e2 - idx_e1
+                    if dist_edus <= dist_max_right:
+                        surviving_cands.append(cand)
+                else:  # left attachment
+                    dist_edus = idx_e1 - idx_e2
+                    if dist_edus <= dist_max_left:
+                        surviving_cands.append(cand)
+            # verbose
+            if True:
+                diff_set = set(cands) - set(surviving_cands)
+                print('pruned {} / {} edges'.format(len(diff_set), len(cands)))
+            cands = surviving_cands
 
     return cands
 
 
-def _maybe_post_label(dpack, models, predictions,
+def _maybe_post_label(dpack, models, predictions, max_dist_by_lbl,
                       mode, clobber=True):
     """
     If post labelling mode is enabled, apply the best label from
     our relation model to all links in the prediction
     """
     if mode == DecodingMode.post_label:
-        return _add_labels(dpack, models, predictions, clobber=clobber)
+        return _add_labels(dpack, models, predictions, max_dist_by_lbl,
+                           clobber=clobber)
     else:
         return predictions
 
@@ -282,7 +337,8 @@ def decode_vanilla(dpack, models, decoder, mode, max_dist_by_lbl):
     """
     cands = build_candidates(dpack, models, mode, max_dist_by_lbl)
     predictions = decoder.decode(cands)
-    return _maybe_post_label(dpack, models, predictions, mode)
+    return _maybe_post_label(dpack, models, predictions, max_dist_by_lbl,
+                             mode)
 
 
 def decode_intra_inter(dpack, models, decoder, mode, max_dist_by_lbl):
@@ -315,10 +371,11 @@ def decode_intra_inter(dpack, models, decoder, mode, max_dist_by_lbl):
         mini_distrib = select_subgrouping(prob_distribs.intra, subg)
         sent_predictions = decoder.decode_sentence(mini_distrib)
         sent_parses.append(_maybe_post_label(dpacks.intra, models.intra,
-                                             sent_predictions, mode))
+                                             sent_predictions,
+                                             max_dist_by_lbl, mode))
     ##########
 
     doc_predictions = decoder.decode_document(prob_distribs.inter, sent_parses)
     return _maybe_post_label(dpacks.inter, models.inter,
-                             doc_predictions, mode,
+                             doc_predictions, max_dist_by_lbl, mode,
                              clobber=False)
